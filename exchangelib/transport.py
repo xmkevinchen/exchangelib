@@ -56,7 +56,7 @@ def _test_service_credentials(protocol):
     data = dummy_xml(version=protocol.version.api_version)
     auth = get_auth_instance(credentials=protocol.credentials, auth_type=protocol.ews_auth_type)
     with requests.sessions.Session() as s:
-        r = s.post(url=protocol.ews_url, headers=headers, data=data, auth=auth, allow_redirects=False)
+        r = s.post(url=protocol.ews_url, headers=headers, data=data, auth=auth, allow_redirects=False, verify=protocol.ssl_verify)
     return _test_response(auth=auth, response=r)
 
 
@@ -147,7 +147,7 @@ def get_auth_type(auth):
         raise ValueError("Authentication model '%s' not supported" % auth.__class__) from e
 
 
-def get_autodiscover_authtype(server, has_ssl, url, data, timeout):
+def get_autodiscover_authtype(server, has_ssl, ssl_verify, url, data, timeout):
     # First issue a HEAD request to look for a location header. This is the autodiscover HTTP redirect method. If there
     # was no redirect, continue trying a POST request with a valid payload.
     log.debug('Getting autodiscover auth type for %s %s', url, timeout)
@@ -162,20 +162,20 @@ def get_autodiscover_authtype(server, has_ssl, url, data, timeout):
             # Some MS servers are masters of fucking up HTTP, issuing 302 to an error page with zero content. Give this
             # URL a chance with a POST request.
             # raise TransportError('Circular redirect')
-        r = s.post(url=url, headers=headers, data=data, timeout=timeout, allow_redirects=False, verify=True)
+        r = s.post(url=url, headers=headers, data=data, timeout=timeout, allow_redirects=False, verify=ssl_verify)
     return _get_auth_method_from_response(server=server, response=r, has_ssl=has_ssl)
 
 
-def get_docs_authtype(server, has_ssl, url):
+def get_docs_authtype(server, has_ssl, ssl_verify=True, url):
     # Get auth type by tasting headers from the server. Don't do HEAD requests. It's too error prone.
     log.debug('Getting docs auth type for %s', url)
     headers = {'Content-Type': 'text/xml; charset=utf-8'}
     with requests.sessions.Session() as s:
-        r = s.get(url=url, headers=headers, allow_redirects=True, verify=True)
+        r = s.get(url=url, headers=headers, allow_redirects=True, verify=ssl_verify)
     return _get_auth_method_from_response(server=server, response=r, has_ssl=has_ssl)
 
 
-def get_service_authtype(server, has_ssl, ews_url, versions):
+def get_service_authtype(server, has_ssl, ssl_verify, ews_url, versions):
     # Get auth type by tasting headers from the server. Only do post requests. HEAD is too error prone, and some servers
     # are set up to redirect to OWA on all requests except POST to /EWS/Exchange.asmx
     log.debug('Getting service auth type for %s', ews_url)
@@ -186,7 +186,7 @@ def get_service_authtype(server, has_ssl, ews_url, versions):
         for version in versions:
             data = dummy_xml(version=version)
             log.debug('Requesting %s from %s', data, ews_url)
-            r = s.post(url=ews_url, headers=headers, data=data, allow_redirects=True, verify=True)
+            r = s.post(url=ews_url, headers=headers, data=data, allow_redirects=True, verify=ssl_verify)
             auth_method = _get_auth_method_from_response(server=server, response=r, has_ssl=has_ssl)
             if auth_method != UNKNOWN:
                 return auth_method
@@ -202,7 +202,7 @@ def _get_auth_method_from_response(server, response, has_ssl):
         return NOAUTH
     if response.status_code == 302:
         # Some servers are set up to redirect to OWA on all requests except POST to EWS/Exchange.asmx
-        redirect_url, redirect_server, redirect_has_ssl = get_redirect_url(response, server, has_ssl)
+        redirect_url, redirect_server, redirect_has_ssl = get_redirect_url(response, server)
         if server == redirect_server and has_ssl == redirect_has_ssl:
             raise TransportError('Circular redirect')
         raise RedirectError(url=redirect_url, server=redirect_server, has_ssl=redirect_has_ssl)

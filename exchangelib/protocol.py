@@ -40,10 +40,11 @@ def close_connections():
 class Protocol:
     SESSION_POOLSIZE = 1
 
-    def __init__(self, ews_url, has_ssl, credentials, ews_auth_type=None):
+    def __init__(self, ews_url, has_ssl, ssl_verify, credentials, ews_auth_type=None):
         assert isinstance(credentials, Credentials)
         self.server = parse.urlparse(ews_url).hostname.lower()
         self.has_ssl = has_ssl
+        self.ssl_verify = ssl_verify
         self.ews_url = ews_url
         scheme = 'https' if self.has_ssl else 'http'
         self.wsdl_url = '%s://%s/EWS/Services.wsdl' % (scheme, self.server)
@@ -72,8 +73,9 @@ class Protocol:
                 log.debug("Cache miss. Adding server '%s', poolsize %s, timeout %s", self.server, POOLSIZE, TIMEOUT)
                 # Autodetect authentication type if necessary
                 self.ews_auth_type = ews_auth_type or get_service_authtype(server=self.server, has_ssl=self.has_ssl,
+                                                                           ssl_verify=self.ssl_verify,
                                                                            ews_url=ews_url, versions=API_VERSIONS)
-                self.docs_auth_type = get_docs_authtype(server=self.server, has_ssl=self.has_ssl, url=self.types_url)
+                self.docs_auth_type = get_docs_authtype(server=self.server, has_ssl=self.has_ssl, ssl_verify=ssl_verify, url=self.types_url)
 
                 # Try to behave nicely with the Exchange server. We want to keep the connection open between requests.
                 # We also want to re-use sessions, to avoid the NTLM auth handshake on every request.
