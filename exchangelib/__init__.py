@@ -1,7 +1,10 @@
-from .credentials import DELEGATE, IMPERSONATION, Credentials
 from .account import Account
 from .autodiscover import discover
 from .configuration import Configuration
+from .credentials import DELEGATE, IMPERSONATION, Credentials
+from .ewsdatetime import EWSDateTime, EWSTimeZone
+from .services import IdOnly, AllProperties, SHALLOW, DEEP
+from .transport import NTLM, DIGEST, BASIC
 
 
 def close_connections():
