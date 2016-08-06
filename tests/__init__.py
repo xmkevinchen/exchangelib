@@ -8,14 +8,62 @@ from decimal import Decimal
 from yaml import load
 
 from exchangelib.account import Account
+from exchangelib.autodiscover import discover
 from exchangelib.configuration import Configuration
-from exchangelib.credentials import DELEGATE
+from exchangelib.credentials import DELEGATE, Credentials
 from exchangelib.ewsdatetime import EWSDateTime, EWSDate, EWSTimeZone, UTC, UTC_NOW
 from exchangelib.folders import CalendarItem, Attendee, Mailbox, Message, ExternId, Choice, Email, Contact, Task, \
-    EmailAddress, PhysicalAddress, PhoneNumber, IndexedField
+    EmailAddress, PhysicalAddress, PhoneNumber, IndexedField, RoomList
 from exchangelib.restriction import Restriction
-from exchangelib.services import GetServerTimeZones, AllProperties, IdOnly
+from exchangelib.services import GetServerTimeZones, GetRoomLists, GetRooms, AllProperties, IdOnly
 from exchangelib.util import xml_to_str, chunkify, peek
+from exchangelib.version import Build
+
+
+class BuildTest(unittest.TestCase):
+    def test_magic(self):
+        with self.assertRaises(ValueError):
+            Build(7, 0)
+        self.assertEqual(str(Build(9, 8, 7, 6)), '9.8.7.6')
+
+    def test_compare(self):
+        self.assertEqual(Build(15, 0, 1, 2), Build(15, 0, 1, 2))
+        self.assertLess(Build(15, 0, 1, 2), Build(15, 0, 1, 3))
+        self.assertLess(Build(15, 0, 1, 2), Build(15, 0, 2, 2))
+        self.assertLess(Build(15, 0, 1, 2), Build(15, 1, 1, 2))
+        self.assertLess(Build(15, 0, 1, 2), Build(16, 0, 1, 2))
+        self.assertLessEqual(Build(15, 0, 1, 2), Build(15, 0, 1, 2))
+        self.assertGreater(Build(15, 0, 1, 2), Build(15, 0, 1, 1))
+        self.assertGreater(Build(15, 0, 1, 2), Build(15, 0, 0, 2))
+        self.assertGreater(Build(15, 1, 1, 2), Build(15, 0, 1, 2))
+        self.assertGreater(Build(15, 0, 1, 2), Build(14, 0, 1, 2))
+        self.assertGreaterEqual(Build(15, 0, 1, 2), Build(15, 0, 1, 2))
+
+    def test_api_version(self):
+        self.assertEqual(Build(8, 0).api_version(), 'Exchange2007')
+        self.assertEqual(Build(8, 1).api_version(), 'Exchange2007_SP1')
+        self.assertEqual(Build(8, 2).api_version(), 'Exchange2007_SP1')
+        self.assertEqual(Build(8, 3).api_version(), 'Exchange2007_SP1')
+        self.assertEqual(Build(15, 0, 1, 1).api_version(), 'Exchange2013')
+        self.assertEqual(Build(15, 0, 1, 1).api_version(), 'Exchange2013')
+        self.assertEqual(Build(15, 0, 847, 0).api_version(), 'Exchange2013_SP1')
+        with self.assertRaises(KeyError):
+            Build(16, 0).api_version()
+        with self.assertRaises(KeyError):
+            Build(15, 4).api_version()
+
+
+class CredentialsTest(unittest.TestCase):
+    def test_hash(self):
+        # Test that we can use credentials as a dict key
+        self.assertEqual(hash(Credentials('a', 'b')), hash(Credentials('a', 'b')))
+        self.assertNotEqual(hash(Credentials('a', 'b')), hash(Credentials('a', 'a')))
+        self.assertNotEqual(hash(Credentials('a', 'b')), hash(Credentials('b', 'b')))
+
+    def test_equality(self):
+        self.assertEqual(Credentials('a', 'b'), Credentials('a', 'b'))
+        self.assertNotEqual(Credentials('a', 'b'), Credentials('a', 'a'))
+        self.assertNotEqual(Credentials('a', 'b'), Credentials('b', 'b'))
 
 
 class EWSDateTest(unittest.TestCase):
@@ -184,7 +232,7 @@ class EWSTest(unittest.TestCase):
         self.tz = EWSTimeZone.timezone('Europe/Copenhagen')
         self.categories = ['Test']
         self.config = Configuration(server=settings['server'], username=settings['username'],
-                                    password=settings['password'])
+                                    password=settings['password'], verify_ssl=settings['verify_ssl'])
         self.account = Account(primary_smtp_address=settings['account'], access_type=DELEGATE, config=self.config)
         self.maxDiff = None
 
@@ -264,6 +312,19 @@ class CommonTest(EWSTest):
         data = ws.call()
         self.assertAlmostEqual(len(data), 100, delta=10, msg=data)
 
+    def test_get_roomlists(self):
+        # The test server is not guaranteed to have any room lists which makes this test less useful
+        ws = GetRoomLists(self.config.protocol)
+        roomlists = ws.call()
+        self.assertEqual(roomlists, [])
+
+    def test_get_rooms(self):
+        # The test server is not guaranteed to have any rooms or room lists which makes this test less useful
+        roomlist = RoomList(email_address='my.roomlist@example.com')
+        ws = GetRooms(self.config.protocol)
+        roomlists = ws.call(roomlist=roomlist)
+        self.assertEqual(roomlists, [])
+
     def test_getfolders(self):
         folders = self.account.root.get_folders()
         self.assertEqual(len(folders), 61, sorted(f.name for f in folders))
@@ -290,10 +351,28 @@ class CommonTest(EWSTest):
         status = self.account.calendar.delete_items(ids)
         self.assertEqual(set(status), {(True, None)})
 
+    def test_magic(self):
+        self.assertIn(self.config.protocol.version.api_version, str(self.config.protocol))
+        self.assertIn(self.config.credentials.username, str(self.config.credentials))
+        self.assertIn(self.account.primary_smtp_address, str(self.account))
 
-class BaseItemMixIn:
+    def test_autodiscover(self):
+        primary_smtp_address, protocol = discover(email=self.account.primary_smtp_address,
+                                                  credentials=self.config.credentials)
+        self.assertEqual(primary_smtp_address, self.account.primary_smtp_address)
+        self.assertEqual(protocol.service_endpoint.lower(), self.config.protocol.service_endpoint.lower())
+        self.assertEqual(protocol.version.build, self.config.protocol.version.build)
+
+
+class BaseItemTest(EWSTest):
     TEST_FOLDER = None
     ITEM_CLASS = None
+
+    @classmethod
+    def setUpClass(cls):
+        if cls is BaseItemTest:
+            raise unittest.SkipTest("Skip BaseItemTest, it's only for inheritance")
+        super().setUpClass()
 
     def setUp(self):
         super().setUp()
@@ -318,7 +397,7 @@ class BaseItemMixIn:
             item_kwargs[f] = self.random_val(field_type)
         return self.ITEM_CLASS(item_id='', changekey='', categories=self.categories, **item_kwargs)
 
-    def test_builtin(self):
+    def test_magic(self):
         item = self.get_test_item()
         if self.ITEM_CLASS == CalendarItem:
             self.assertIn('ItemId', str(item))
@@ -540,22 +619,22 @@ class BaseItemMixIn:
         self.assertEqual(status, [(True, None)])
 
 
-class CalendarTest(BaseItemMixIn, EWSTest):
+class CalendarTest(BaseItemTest):
     TEST_FOLDER = 'calendar'
     ITEM_CLASS = CalendarItem
 
 
-class InboxTest(BaseItemMixIn, EWSTest):
+class InboxTest(BaseItemTest):
     TEST_FOLDER = 'inbox'
     ITEM_CLASS = Message
 
 
-class TasksTest(BaseItemMixIn, EWSTest):
+class TasksTest(BaseItemTest):
     TEST_FOLDER = 'tasks'
     ITEM_CLASS = Task
 
 
-class ContactsTest(BaseItemMixIn, EWSTest):
+class ContactsTest(BaseItemTest):
     TEST_FOLDER = 'contacts'
     ITEM_CLASS = Contact
 

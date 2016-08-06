@@ -10,15 +10,15 @@ from multiprocessing.pool import ThreadPool
 import logging
 from collections import defaultdict
 from threading import Lock
-from urllib import parse
 import random
 
 from requests import adapters, Session
 
 from .credentials import Credentials
 from .errors import TransportError
-from .transport import get_auth_instance, get_service_authtype, get_docs_authtype, test_credentials
+from .transport import get_auth_instance, get_service_authtype, get_docs_authtype, test_credentials, AUTH_TYPE_MAP
 from .version import Version, API_VERSIONS
+from .util import split_url
 
 log = logging.getLogger(__name__)
 
@@ -26,87 +26,47 @@ log = logging.getLogger(__name__)
 _server_cache = defaultdict(dict)
 _server_cache_lock = Lock()
 
-POOLSIZE = 4
-TIMEOUT = 120
-
 
 def close_connections():
     for cached_key, cached_values in _server_cache.items():
         server = cached_key[0]  # cached_key = server, username
-        cached_protocol = Protocol('https://%s/EWS/Exchange.asmx' % server, True, Credentials('', ''))
+        # Create a simple Protocol that we can close TCP connections on
+        cached_protocol = Protocol(service_endpoint='https://%s/EWS/Exchange.asmx' % server,
+                                   credentials=Credentials('', ''))
         cached_protocol.close()
 
 
-class Protocol:
-    SESSION_POOLSIZE = 1
+class BaseProtocol:
+    # Base class for Protocol which implements the bare essentials
 
-    def __init__(self, ews_url, has_ssl, ssl_verify, credentials, ews_auth_type=None):
+    # The maximum number of sessions (== TCP connections, see below) we will open to this service endpoint. Keep this
+    # low unless you have an agreement with the Exchange admin on the receiving end to hammer the server and
+    # rate-limiting policies have been disabled for the connecting user.
+    SESSION_POOLSIZE = 4
+    # We want only 1 TCP connection per Session object. We may have lots of different credentials hitting the server and
+    # each credential needs its own session (NTLM auth will only send credentials once and then secure the connection,
+    # so a connection can only handle requests for one credential). Having multiple connections ser Session could
+    # quickly exhaust the maximum number of concurrent connections the Exchange server allows from one client.
+    CONNECTIONS_PER_SESSION = 1
+    # Timeout for HTTP requests
+    TIMEOUT = 120
+
+    def __init__(self, service_endpoint, credentials, auth_type, verify_ssl):
         assert isinstance(credentials, Credentials)
-        self.server = parse.urlparse(ews_url).hostname.lower()
-        self.has_ssl = has_ssl
-        self.ssl_verify = ssl_verify
-        self.ews_url = ews_url
-        scheme = 'https' if self.has_ssl else 'http'
-        self.wsdl_url = '%s://%s/EWS/Services.wsdl' % (scheme, self.server)
-        self.messages_url = '%s://%s/EWS/messages.xsd' % (scheme, self.server)
-        self.types_url = '%s://%s/EWS/types.xsd' % (scheme, self.server)
+        if auth_type is not None:
+            assert auth_type in AUTH_TYPE_MAP, 'Unsupported auth type %s' % auth_type
+        self.has_ssl, self.server, _ = split_url(service_endpoint)
         self.credentials = credentials
-        self.timeout = TIMEOUT
-
-        # Acquire lock to guard against multiple threads competing to cache information. Having a per-server lock is
-        # overkill.
-        log.debug('Waiting for _server_cache_lock')
-        with _server_cache_lock:
-            _server_cache_key = self.server, self.credentials.username
-            if _server_cache_key in _server_cache:
-                # Get cached version and auth types and session / thread pools
-                log.debug("Cache hit for server '%s'", self.server)
-                for k, v in _server_cache[_server_cache_key].items():
-                    setattr(self, k, v)
-
-                if ews_auth_type:
-                    if ews_auth_type != self.ews_auth_type:
-                        # Some Exchange servers just can't make up their mind
-                        log.debug('Auth type mismatch on server %s. %s != %s' % (self.server, ews_auth_type,
-                                                                                 self.ews_auth_type))
-            else:
-                log.debug("Cache miss. Adding server '%s', poolsize %s, timeout %s", self.server, POOLSIZE, TIMEOUT)
-                # Autodetect authentication type if necessary
-                self.ews_auth_type = ews_auth_type or get_service_authtype(server=self.server, has_ssl=self.has_ssl,
-                                                                           ssl_verify=self.ssl_verify,
-                                                                           ews_url=ews_url, versions=API_VERSIONS)
-                self.docs_auth_type = get_docs_authtype(server=self.server, has_ssl=self.has_ssl, ssl_verify=ssl_verify, url=self.types_url)
-
-                # Try to behave nicely with the Exchange server. We want to keep the connection open between requests.
-                # We also want to re-use sessions, to avoid the NTLM auth handshake on every request.
-                assert POOLSIZE > 0
-                self._session_pool = queue.LifoQueue(maxsize=POOLSIZE)
-                for i in range(POOLSIZE):
-                    self._session_pool.put(self.create_session(), block=False)
-
-                # Used by services to process service requests that are able to run in parallel. Thread pool should be
-                # larger than connection the pool so we have time to process data without idling the connection.
-                thread_poolsize = 4 * POOLSIZE
-                self.thread_pool = ThreadPool(processes=thread_poolsize)
-
-                # Needs auth objects and a working session pool
-                self.version = Version.guess(self)
-
-                # Cache results
-                _server_cache[_server_cache_key] = dict(
-                    version=self.version,
-                    ews_auth_type=self.ews_auth_type,
-                    docs_auth_type=self.docs_auth_type,
-                    thread_pool=self.thread_pool,
-                    _session_pool=self._session_pool,
-                )
-        log.debug('_server_cache_lock released')
+        self.service_endpoint = service_endpoint
+        self.auth_type = auth_type
+        self.verify_ssl = verify_ssl
+        self._session_pool = None  # Consumers need to fill the session pool themselves
 
     def close(self):
         log.debug('Server %s: Closing sessions', self.server)
         while True:
             try:
-                self._session_pool.get(block=False).close_socket(self.ews_url)
+                self._session_pool.get(block=False).close_socket(self.service_endpoint)
             except queue.Empty:
                 break
 
@@ -133,16 +93,33 @@ class Protocol:
     def retire_session(self, session):
         # The session is useless. Close it completely and place a fresh session in the pool
         log.debug('Server %s: Retiring session %s', self.server, session.session_id)
-        session.close_socket(self.ews_url)
+        session.close_socket(self.service_endpoint)
         del session
         self.release_session(self.create_session())
 
     def renew_session(self, session):
         # The session is useless. Close it completely and place a fresh session in the pool
         log.debug('Server %s: Renewing session %s', self.server, session.session_id)
-        session.close_socket(self.ews_url)
+        session.close_socket(self.service_endpoint)
         del session
         return self.create_session()
+
+    def create_session(self):
+        session = EWSSession(self)
+        session.auth = get_auth_instance(credentials=self.credentials, auth_type=self.auth_type)
+        # Leave this inside the loop because headers are mutable
+        headers = {'Content-Type': 'text/xml; charset=utf-8', 'Accept-Encoding': 'compress, gzip'}
+        session.headers.update(headers)
+        scheme = 'https' if self.has_ssl else 'http'
+        # We want just one connection per session. No retries, since we wrap all requests in our own retry handler
+        session.mount('%s://' % scheme, adapters.HTTPAdapter(
+            pool_block=True,
+            pool_connections=self.CONNECTIONS_PER_SESSION,
+            pool_maxsize=self.CONNECTIONS_PER_SESSION,
+            max_retries=0
+        ))
+        log.debug('Server %s: Created session %s', self.server, session.session_id)
+        return session
 
     def test(self):
         # We need the version for this
@@ -152,40 +129,89 @@ class Protocol:
             raise TransportError("Server '%s' does not exist" % self.server) from e
         return test_credentials(protocol=self)
 
+    def __repr__(self):
+        return self.__class__.__name__ + repr((self.service_endpoint, self.credentials, self.auth_type,
+                                               self.verify_ssl))
+
+
+class Protocol(BaseProtocol):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        scheme = 'https' if self.has_ssl else 'https'
+        self.wsdl_url = '%s://%s/EWS/Services.wsdl' % (scheme, self.server)
+        self.messages_url = '%s://%s/EWS/messages.xsd' % (scheme, self.server)
+        self.types_url = '%s://%s/EWS/types.xsd' % (scheme, self.server)
+
+        # Acquire lock to guard against multiple threads competing to cache information. Having a per-server lock is
+        # overkill.
+        log.debug('Waiting for _server_cache_lock')
+        with _server_cache_lock:
+            _server_cache_key = self.server, self.credentials
+            if _server_cache_key in _server_cache:
+                # Get cached version and auth types and session / thread pools
+                log.debug("Cache hit for server '%s'", self.server)
+                auth_type = self.auth_type
+                for k, v in _server_cache[_server_cache_key].items():
+                    setattr(self, k, v)
+
+                if auth_type:
+                    if auth_type != self.auth_type:
+                        # Some Exchange servers just can't make up their mind about which auth to prefer
+                        log.debug('Auth type mismatch on server %s. %s != %s' % (self.server, auth_type,
+                                                                                 self.auth_type))
+            else:
+                log.debug("Cache miss. Adding server '%s', poolsize %s, timeout %s", self.server, self.SESSION_POOLSIZE,
+                          self.TIMEOUT)
+                # Autodetect authentication type if necessary
+                if not self.auth_type:
+                    self.auth_type = get_service_authtype(service_endpoint=self.service_endpoint, versions=API_VERSIONS,
+                                                          verify=self.verify_ssl)
+                self.docs_auth_type = get_docs_authtype(verify=self.verify_ssl, docs_url=self.types_url)
+
+                # Try to behave nicely with the Exchange server. We want to keep the connection open between requests.
+                # We also want to re-use sessions, to avoid the NTLM auth handshake on every request.
+                self._session_pool = queue.LifoQueue(maxsize=self.SESSION_POOLSIZE)
+                for i in range(self.SESSION_POOLSIZE):
+                    self._session_pool.put(self.create_session(), block=False)
+
+                # Used by services to process service requests that are able to run in parallel. Thread pool should be
+                # larger than connection the pool so we have time to process data without idling the connection.
+                thread_poolsize = 4 * self.SESSION_POOLSIZE
+                self.thread_pool = ThreadPool(processes=thread_poolsize)
+
+                # Needs auth objects and a working session pool
+                self.version = Version.guess(self)
+
+                # Cache results
+                _server_cache[_server_cache_key] = dict(
+                    version=self.version,
+                    auth_type=self.auth_type,
+                    docs_auth_type=self.docs_auth_type,
+                    thread_pool=self.thread_pool,
+                    _session_pool=self._session_pool,
+                )
+        log.debug('_server_cache_lock released')
+
     def __str__(self):
         return '''\
 EWS url: %s
-Product version (according to XSD): %s
-API version (according to SOAP headers): %s
-Full name: %s
-Build numbers: %s
+Product name: %s
+EWS API version: %s
+Build number: %s
 EWS auth: %s
 XSD auth: %s''' % (
-            self.ews_url,
-            self.version.shortname,
+            self.service_endpoint,
+            self.version.fullname,
             self.version.api_version,
-            self.version.name,
             self.version.build,
-            self.ews_auth_type,
+            self.auth_type,
             self.docs_auth_type,
         )
 
-    def create_session(self):
-        session = EWSSession(self)
-        session.auth = get_auth_instance(credentials=self.credentials, auth_type=self.ews_auth_type)
-        # Leave this inside the loop because headers are mutable
-        headers = {'Content-Type': 'text/xml; charset=utf-8', 'Accept-Encoding': 'compress, gzip'}
-        session.headers.update(headers)
-        scheme = 'https' if self.has_ssl else 'http'
-        # We want just one connection per session. No retries, since we wrap all requests in our own retry handler
-        assert self.SESSION_POOLSIZE > 0
-        session.mount('%s://' % scheme, adapters.HTTPAdapter(pool_block=True, pool_connections=self.SESSION_POOLSIZE,
-                                                             pool_maxsize=self.SESSION_POOLSIZE, max_retries=0))
-        log.debug('Server %s: Created session %s', self.server, session.session_id)
-        return session
-
 
 class EWSSession(Session):
+    # A requests Session object that closes the underlying socket when we need it
     def __init__(self, protocol):
         self.session_id = random.randint(1, 32767)  # Used for debugging messages in services
         self.protocol = protocol
@@ -210,4 +236,4 @@ class EWSSession(Session):
             self.protocol.release_session(self)
         else:
             self.protocol.retire_session(self)
-        # return super().__exit__()  # We don't want to close the session socket when we have used the session
+        # return super().__exit__()  # We want to close the session socket explicitly

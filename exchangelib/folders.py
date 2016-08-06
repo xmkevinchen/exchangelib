@@ -12,8 +12,9 @@ from .credentials import DELEGATE
 from .ewsdatetime import EWSDateTime, UTC_NOW
 from .restriction import Restriction
 from .services import TNS, FindItem, IdOnly, SHALLOW, DEEP, DeleteItem, CreateItem, UpdateItem, FindFolder, GetFolder, \
-    GetItem
+    GetItem, MNS
 from .util import create_element, add_xml_child, get_xml_attrs, get_xml_attr, set_xml_value, ElementType, peek
+from .version import EXCHANGE_2010, EXCHANGE_2013
 
 log = getLogger(__name__)
 
@@ -295,6 +296,36 @@ class Mailbox(EWSElement):
 
     def __repr__(self):
         return self.__class__.__name__ + repr((self.name, self.email_address, self.mailbox_type, self.item_id))
+
+
+class RoomList(Mailbox):
+    ELEMENT_NAME = 'RoomList'
+
+    @classmethod
+    def request_tag(cls):
+        return 'm:%s' % cls.ELEMENT_NAME
+
+
+    @classmethod
+    def response_tag(cls):
+        return '{%s}%s' % (MNS, cls.ELEMENT_NAME)
+
+
+class Room(Mailbox):
+    ELEMENT_NAME = 'Room'
+
+    @classmethod
+    def from_xml(cls, elem):
+        if elem is None:
+            return None
+        assert elem.tag == cls.response_tag(), (elem.tag, cls.response_tag())
+        id_elem = elem.find('{%s}Id' % TNS)
+        return cls(
+            name=get_xml_attr(id_elem, '{%s}Name' % TNS),
+            email_address=get_xml_attr(id_elem, '{%s}EmailAddress' % TNS),
+            mailbox_type=get_xml_attr(id_elem, '{%s}MailboxType' % TNS),
+            item_id=ItemId.from_xml(id_elem.find(ItemId.response_tag())),
+        )
 
 
 class ExtendedProperty(EWSElement):
@@ -616,7 +647,7 @@ class Item(EWSElement):
 
 
 class Folder:
-    DISTINGUISHED_FOLDER_ID = None
+    DISTINGUISHED_FOLDER_ID = None  # Must be lowercase
     CONTAINER_CLASS = None  # See http://msdn.microsoft.com/en-us/library/hh354773(v=exchg.80).aspx
     item_model = Item
 
@@ -662,9 +693,10 @@ class Folder:
         # Define the extra properties we want on the return objects. 'body' field can only be fetched with GetItem.
         additional_fields = ['item:Categories'] if categories else None
         # Define any search restrictions we want to set on the search.
-        # TODO Filtering by category doesn't work on Exchange 2010, returning "ErrorContainsFilterWrongType:
-        # The Contains filter can only be used for string properties." Fall back to filtering after getting all items
-        # instead. This may be a legal problem because we get ALL items, including private appointments.
+        # TODO Filtering by category doesn't work on Exchange 2010 (and others?), returning
+        # "ErrorContainsFilterWrongType: The Contains filter can only be used for string properties." Fall back to
+        # filtering after getting all items instead. This may be a legal and a performance problem because we get ALL
+        # items, including private appointments.
         restriction = Restriction.from_params(start=start, end=end, subject=subject)
         items = FindItem(self.account.protocol).call(folder=self, additional_fields=additional_fields,
                                                      restriction=restriction, shape=shape, depth=depth)
@@ -805,7 +837,7 @@ class Folder:
         return createitem
 
     def delete_xml(self, ids, all_occurrences=True):
-        # Prepare reuseable Element objects. # TODO: Make it possible to set all_occurrences from somewhere
+        # Prepare reuseable Element objects. # TODO: Make it possible to set all_occurrences in higher-level code
         if isinstance(self, Calendar):
             deleteitem = create_element(
                 'm:%s' % DeleteItem.SERVICE_NAME, DeleteType='HardDelete', SendMeetingCancellations='SendToNone')
@@ -815,7 +847,7 @@ class Folder:
                 AffectedTaskOccurrences='AllOccurrences' if all_occurrences else 'SpecifiedOccurrenceOnly')
         else:
             deleteitem = create_element('m:%s' % DeleteItem.SERVICE_NAME, DeleteType='HardDelete')
-        if self.account.version.major_version >= 15:
+        if self.account.version.build >= EXCHANGE_2013:
             deleteitem.set('SuppressReadReceipts', 'true')
 
         item_ids = create_element('m:ItemIds')
@@ -839,7 +871,7 @@ class Folder:
                                         MessageDisposition='SaveOnly')
         else:
             updateitem = create_element('m:%s' % UpdateItem.SERVICE_NAME, ConflictResolution='AutoResolve')
-        if self.account.version.major_version >= 15:
+        if self.account.version.build >= EXCHANGE_2013:
             updateitem.set('SuppressReadReceipts', 'true')
 
         itemchanges = create_element('m:ItemChanges')
@@ -865,7 +897,8 @@ class Folder:
                 elif issubclass(field_uri, IndexedField):
                     log.warning("Skipping update on fieldname '%s' (not supported yet)", fieldname)
                     continue
-                    # TODO: we need to create a SetItemField for every item in the list, and possibly DeleteItemField for every label not on the list
+                    # TODO: we need to create a SetItemField for every item in the list, and possibly DeleteItemField
+                    # for every label not on the list
                     # fielduri = field_uri.field_uri_xml(label=val.label)
                 elif issubclass(field_uri, ExtendedProperty):
                     fielduri = field_uri.field_uri_xml()
@@ -896,7 +929,7 @@ class Folder:
                     # instead of explicit timezone on each datetime field.
                     setitemfield_tz = create_element('t:SetItemField')
                     folderitem_tz = create_element(self.item_model.request_tag())
-                    if self.account.version.major_version < 14:
+                    if self.account.version.build < EXCHANGE_2010:
                         if meeting_timezone_added:
                             # Let's hope that we're not changing timezone, or that both 'start' and 'end' are supplied.
                             # Exchange 2007 doesn't support different timezone on start and end.
@@ -1059,7 +1092,7 @@ class CalendarItem(ItemMixIn):
     LOCATION_MAXLENGTH = 255
     FIELDURI_PREFIX = 'calendar'
     CHOICES = {
-        # TODO: 'WorkingElsewhere' was added in Exchange2015 but we don't support versioned choices yet
+        # TODO: The 'WorkingElsewhere' status was added in Exchange2015 but we don't support versioned choices yet
         'legacy_free_busy_status': {'Free', 'Tentative', 'Busy', 'OOF', 'NoData'},
     }
     ITEM_FIELDS = {
@@ -1099,7 +1132,7 @@ class CalendarItem(ItemMixIn):
         # WARNING: The order of addition of XML elements is VERY important. Exchange expects XML elements in a
         # specific, non-documented order and will fail with meaningless errors if the order is wrong.
         i = super().to_xml(version=version)
-        if version.major_version < 14:
+        if version.build < EXCHANGE_2010:
             i.append(create_element('t:MeetingTimeZone', TimeZoneName=self.start.tzinfo.ms_id))
         else:
             i.append(create_element('t:StartTimeZone', Id=self.start.tzinfo.ms_id, Name=self.start.tzinfo.ms_name))

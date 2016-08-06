@@ -25,7 +25,8 @@ from .errors import EWSWarning, TransportError, SOAPError, ErrorTimeoutExpired, 
     ErrorInvalidServerVersion
 from .transport import wrap, SOAPNS, TNS, MNS, ENS
 from .util import chunkify, create_element, add_xml_child, get_xml_attr, to_xml, post_ratelimited, ElementType, \
-    xml_to_str
+    xml_to_str, set_xml_value
+from .version import EXCHANGE_2010
 
 log = logging.getLogger(__name__)
 
@@ -43,13 +44,13 @@ SOFTDELETED = 'SoftDeleted'
 
 
 class EWSService:
-    SERVICE_NAME = None
-    element_container_name = None
-    extra_element_names = []
+    SERVICE_NAME = None  # The name of the SOAP service
+    element_container_name = None  # The name of the XML element wrapping the collection of returned items
+    extra_element_names = []  # Some services may return multiple item types. List them here.
 
-    def __init__(self, protocol, element_name=None):
+    def __init__(self, protocol):
         self.protocol = protocol
-        self.element_name = element_name
+        self.element_name = None
 
     def payload(self, version, account, *args, **kwargs):
         return wrap(content=self._get_payload(*args, **kwargs), version=version, account=account)
@@ -73,7 +74,7 @@ class EWSService:
             raise
         except Exception:
             # This may run from a thread pool, which obfuscates the stack trace. Print trace immediately.
-            log.warning('EWS %s, account %s: Exception in _get_elements: %s', self.protocol.ews_url, account,
+            log.warning('EWS %s, account %s: Exception in _get_elements: %s', self.protocol.service_endpoint, account,
                         traceback.format_exc(20))
             raise
 
@@ -93,11 +94,11 @@ class EWSService:
             r, session = post_ratelimited(
                 protocol=self.protocol,
                 session=session,
-                url=self.protocol.ews_url,
+                url=self.protocol.service_endpoint,
                 headers=None,
                 data=soap_payload,
-                timeout=self.protocol.timeout,
-                verify=True,
+                timeout=self.protocol.TIMEOUT,
+                verify=self.protocol.verify_ssl,
                 allow_redirects=False)
             self.protocol.release_session(session)
             log.debug('Trying API version %s for account %s', api_version, account)
@@ -121,7 +122,6 @@ class EWSService:
                                                          (api_versions, account))
 
     def _get_soap_payload(self, soap_response):
-        log_prefix = 'EWS %s, service %s' % (self.protocol.ews_url, self.SERVICE_NAME)
         assert isinstance(soap_response, ElementType)
         body = soap_response.find('{%s}Body' % SOAPNS)
         if body is None:
@@ -134,12 +134,12 @@ class EWSService:
             self._raise_soap_errors(fault=fault)  # Will throw SOAPError
         response_messages = response.find('{%s}ResponseMessages' % MNS)
         if response_messages is None:
-            raise TransportError('%s: No ResponseMessages element in response' % log_prefix)
+            return response.findall('{%s}%sResponse' % (MNS, self.SERVICE_NAME))
         return response_messages.findall('{%s}%sResponseMessage' % (MNS, self.SERVICE_NAME))
 
     def _raise_soap_errors(self, fault):
         assert isinstance(fault, ElementType)
-        log_prefix = 'EWS %s, service %s' % (self.protocol.ews_url, self.SERVICE_NAME)
+        log_prefix = 'EWS %s, service %s' % (self.protocol.service_endpoint, self.SERVICE_NAME)
         # Fault: See http://www.w3.org/TR/2000/NOTE-SOAP-20000508/#_Toc478383507
         faultcode = get_xml_attr(fault, 'faultcode')
         faultstring = get_xml_attr(fault, 'faultstring')
@@ -222,6 +222,7 @@ class EWSService:
         return elements
 
     def _get_elements_in_container(self, container):
+        assert self.element_name
         elems = container.findall(self.element_name)
         for element_name in self.extra_element_names:
             elems.extend(container.findall(element_name))
@@ -242,7 +243,7 @@ class PagingEWSService(EWSService):
     def _paged_call(self, **kwargs):
         # TODO This is awkward. The function must work with _get_payload() of both folder- and account-based services
         account = kwargs['folder'].account if 'folder' in kwargs else kwargs['account']
-        log_prefix = 'EWS %s, account %s, service %s' % (self.protocol.ews_url, account, self.SERVICE_NAME)
+        log_prefix = 'EWS %s, account %s, service %s' % (self.protocol.service_endpoint, account, self.SERVICE_NAME)
         elements = []
         offset = 0
         while True:
@@ -263,7 +264,7 @@ class PagingEWSService(EWSService):
 
     def _get_page(self, response):
         assert len(response) == 1
-        log_prefix = 'EWS %s, service %s' % (self.protocol.ews_url, self.SERVICE_NAME)
+        log_prefix = 'EWS %s, service %s' % (self.protocol.service_endpoint, self.SERVICE_NAME)
         rootfolder = self._get_element_container(message=response[0], name='{%s}RootFolder' % MNS)
         is_last_page = rootfolder.get('IncludesLastItemInRange').lower() in ('true', '0')
         offset = rootfolder.get('IndexedPagingOffset')
@@ -283,11 +284,11 @@ class GetServerTimeZones(EWSService):
     element_container_name = '{%s}TimeZoneDefinitions' % MNS
 
     def __init__(self, *args, **kwargs):
-        kwargs['element_name'] = '{%s}TimeZoneDefinition' % TNS
         super().__init__(*args, **kwargs)
+        self.element_name = '{%s}TimeZoneDefinition' % TNS
 
     def call(self, **kwargs):
-        if self.protocol.version.major_version < 14:
+        if self.protocol.version.build < EXCHANGE_2010:
             raise NotImplementedError('%s is only supported for Exchange 2010 servers and later' % self.SERVICE_NAME)
         return self._get_elements(payload=self._get_payload(**kwargs))
 
@@ -303,6 +304,48 @@ class GetServerTimeZones(EWSService):
             name = timezonedef.get('Name')
             timezones.append((tz_id, name))
         return timezones
+
+
+class GetRoomLists(EWSService):
+    SERVICE_NAME = 'GetRoomLists'
+    element_container_name = '{%s}RoomLists' % MNS
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .folders import RoomList
+        self.element_name = RoomList.response_tag()
+
+    def call(self, **kwargs):
+        if self.protocol.version.build < EXCHANGE_2010:
+            raise NotImplementedError('%s is only supported for Exchange 2010 servers and later' % self.SERVICE_NAME)
+        elements = self._get_elements(payload=self._get_payload(**kwargs))
+        from .folders import RoomList
+        return [RoomList.from_xml(elem) for elem in elements]
+
+    def _get_payload(self, *args, **kwargs):
+        return create_element('m:%s' % self.SERVICE_NAME)
+
+
+class GetRooms(EWSService):
+    SERVICE_NAME = 'GetRooms'
+    element_container_name = '{%s}Rooms' % MNS
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .folders import Room
+        self.element_name = Room.response_tag()
+
+    def call(self, roomlist, **kwargs):
+        if self.protocol.version.build < EXCHANGE_2010:
+            raise NotImplementedError('%s is only supported for Exchange 2010 servers and later' % self.SERVICE_NAME)
+        elements = self._get_elements(payload=self._get_payload(roomlist, **kwargs))
+        from .folders import Room
+        return [Room.from_xml(elem) for elem in elements]
+
+    def _get_payload(self, roomlist, *args, **kwargs):
+        getrooms = create_element('m:%s' % self.SERVICE_NAME)
+        set_xml_value(getrooms, roomlist, self.protocol.version)
+        return getrooms
 
 
 class EWSPooledService(EWSService):
@@ -425,8 +468,8 @@ class FindFolder(PagingEWSService, EWSFolderService):
     ]
 
     def __init__(self, *args, **kwargs):
-        kwargs['element_name'] = '{%s}Folder' % TNS
         super().__init__(*args, **kwargs)
+        self.element_name = '{%s}Folder' % TNS
 
     def call(self, folder, **kwargs):
         return self._paged_call(folder=folder, **kwargs)
@@ -448,7 +491,7 @@ class FindFolder(PagingEWSService, EWSFolderService):
                 additionalproperties.append(create_element('t:FieldURI', FieldURI=field_uri))
             foldershape.append(additionalproperties)
         findfolder.append(foldershape)
-        if folder.account.protocol.version.major_version >= 14:
+        if folder.account.protocol.version.build >= EXCHANGE_2010:
             indexedpageviewitem = create_element('m:IndexedPageFolderView', Offset=str(offset), BasePoint='Beginning')
             findfolder.append(indexedpageviewitem)
         else:
@@ -471,8 +514,8 @@ class GetFolder(EWSFolderService):
     ]
 
     def __init__(self, *args, **kwargs):
-        kwargs['element_name'] = '{%s}Folder' % TNS
         super().__init__(*args, **kwargs)
+        self.element_name = '{%s}Folder' % TNS
 
     def call(self, folder, **kwargs):
         return self._get_elements(payload=self._get_payload(folder, **kwargs), account=folder.account)
@@ -505,8 +548,8 @@ class ResolveNames(EWSAccountService):
     element_container_name = '{%s}ResolutionSet' % MNS
 
     def __init__(self, *args, **kwargs):
-        kwargs['element_name'] = '{%s}Resolution' % TNS
         super().__init__(*args, **kwargs)
+        self.element_name = '{%s}Resolution' % TNS
 
     def call(self, **kwargs):
         return self._get_elements(payload=self._get_payload(**kwargs))
