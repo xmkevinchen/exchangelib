@@ -61,7 +61,7 @@ class EWSService:
 
     def payload(self, version, account, *args, **kwargs):
         timezone = kwargs.get('timezone')
-        return wrap(content=self._get_payload(*args, **kwargs), version=version, account=account, timezone=timezone)
+        return wrap(content=self._get_payload(*args, **kwargs), version=version, account=account, ewstimezone=timezone)
 
     def _get_payload(self, *args, **kwargs):
         raise NotImplementedError()
@@ -103,7 +103,7 @@ class EWSService:
         api_versions = [hint] + [v for v in API_VERSIONS if v != hint]
         for api_version in api_versions:
             session = self.protocol.get_session()
-            soap_payload = wrap(content=payload, version=api_version, account=account, timezone=timezone)
+            soap_payload = wrap(content=payload, version=api_version, account=account, ewstimezone=timezone)
             r, session = post_ratelimited(
                 protocol=self.protocol,
                 session=session,
