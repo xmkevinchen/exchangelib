@@ -10,10 +10,10 @@ Exchange EWS references:
     - 2013: http://msdn.microsoft.com/en-us/library/bb409286(v=exchg.150).aspx
 """
 
-import logging
 import itertools
-from xml.parsers.expat import ExpatError
+import logging
 import traceback
+from xml.parsers.expat import ExpatError
 
 from . import errors
 from .errors import EWSWarning, TransportError, SOAPError, ErrorTimeoutExpired, ErrorBatchProcessingStopped, \
@@ -27,9 +27,9 @@ from .transport import wrap, SOAPNS, TNS, MNS, ENS
 from .util import chunkify, create_element, add_xml_child, get_xml_attr, to_xml, post_ratelimited, ElementType, \
     xml_to_str, set_xml_value
 from .version import EXCHANGE_2010
+from .ewsdatetime import EWSTimeZone
 
 log = logging.getLogger(__name__)
-
 
 # Shape enums
 IdOnly = 'IdOnly'
@@ -45,6 +45,13 @@ SOFTDELETED = 'SoftDeleted'
 
 class EWSService:
     SERVICE_NAME = None  # The name of the SOAP service
+
+    # The name of the SOAP service response, if None try to use the SERVICE_NAME+RESPONSE
+    # Some service don't follow the name pattern
+    # Like GetUserAvailability operation (https://msdn.microsoft.com/en-us/library/aa564001(v=exchg.150).aspx)
+    # The service name in request is GetUserAvailabilityRequest,
+    # however, the response name is GetUserAvailabilityResponse
+    SERVICE_RESPONSE_NAME = None
     element_container_name = None  # The name of the XML element wrapping the collection of returned items
     extra_element_names = []  # Some services may return multiple item types. List them here.
 
@@ -53,15 +60,16 @@ class EWSService:
         self.element_name = None
 
     def payload(self, version, account, *args, **kwargs):
-        return wrap(content=self._get_payload(*args, **kwargs), version=version, account=account)
+        timezone = kwargs.get('timezone')
+        return wrap(content=self._get_payload(*args, **kwargs), version=version, account=account, timezone=timezone)
 
     def _get_payload(self, *args, **kwargs):
         raise NotImplementedError()
 
-    def _get_elements(self, payload, account=None):
+    def _get_elements(self, payload, account=None, *args, **kwargs):
         assert isinstance(payload, ElementType)
         try:
-            response = self._get_response_xml(payload=payload, account=account)
+            response = self._get_response_xml(payload=payload, account=account, *args, **kwargs)
             return self._get_elements_in_response(response=response)
         except (ErrorQuotaExceeded, ErrorCannotDeleteObject, ErrorCreateItemAccessDenied, ErrorTimeoutExpired,
                 ErrorFolderNotFound, ErrorNonExistentMailbox, ErrorMailboxStoreUnavailable, ErrorImpersonateUserDenied,
@@ -78,9 +86,14 @@ class EWSService:
                         traceback.format_exc(20))
             raise
 
-    def _get_response_xml(self, payload, account=None):
+    def _get_response_xml(self, payload, account=None, *args, **kwargs):
         # Takes an XML tree and returns SOAP payload as an XML tree
         assert isinstance(payload, ElementType)
+
+        # Timezone is very critical for some operations
+        timezone = kwargs.get('timezone')
+        assert isinstance(timezone, EWSTimeZone)
+
         # Microsoft really doesn't want to make our lives easy. The server may report one version in our initial version
         # guessing tango, but then the server may decide that any arbitrary legacy backend server may actually process
         # the request for an account. Prepare to handle ErrorInvalidSchemaVersionForMailboxVersion errors and set the
@@ -90,7 +103,7 @@ class EWSService:
         api_versions = [hint] + [v for v in API_VERSIONS if v != hint]
         for api_version in api_versions:
             session = self.protocol.get_session()
-            soap_payload = wrap(content=payload, version=api_version, account=account)
+            soap_payload = wrap(content=payload, version=api_version, account=account, timezone=timezone)
             r, session = post_ratelimited(
                 protocol=self.protocol,
                 session=session,
@@ -126,7 +139,12 @@ class EWSService:
         body = soap_response.find('{%s}Body' % SOAPNS)
         if body is None:
             raise TransportError('No Body element in SOAP response')
-        response = body.find('{%s}%sResponse' % (MNS, self.SERVICE_NAME))
+
+        # Check whether has specified service response name, otherwise uses the service name
+        if self.SERVICE_RESPONSE_NAME is None:
+            self.SERVICE_RESPONSE_NAME = self.SERVICE_NAME
+        response = body.find('{%s}%sResponse' % (MNS, self.SERVICE_RESPONSE_NAME))
+
         if response is None:
             fault = body.find('{%s}Fault' % SOAPNS)
             if fault is None:
