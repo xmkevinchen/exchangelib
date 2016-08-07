@@ -141,9 +141,10 @@ class EWSService:
             raise TransportError('No Body element in SOAP response')
 
         # Check whether has specified service response name, otherwise uses the service name
-        if self.SERVICE_RESPONSE_NAME is None:
-            self.SERVICE_RESPONSE_NAME = self.SERVICE_NAME
-        response = body.find('{%s}%sResponse' % (MNS, self.SERVICE_RESPONSE_NAME))
+        if self.SERVICE_RESPONSE_NAME is not None:
+            response = body.find('{%s}%s' % (MNS, self.SERVICE_RESPONSE_NAME))
+        else:
+            response = body.find('{%s}%sResponse' % (MNS, self.SERVICE_NAME))
 
         if response is None:
             fault = body.find('{%s}Fault' % SOAPNS)
