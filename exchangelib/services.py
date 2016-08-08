@@ -45,13 +45,6 @@ SOFTDELETED = 'SoftDeleted'
 
 class EWSService:
     SERVICE_NAME = None  # The name of the SOAP service
-
-    # The name of the SOAP service response, if None try to use the SERVICE_NAME+RESPONSE
-    # Some service don't follow the name pattern
-    # Like GetUserAvailability operation (https://msdn.microsoft.com/en-us/library/aa564001(v=exchg.150).aspx)
-    # The service name in request is GetUserAvailabilityRequest,
-    # however, the response name is GetUserAvailabilityResponse
-    SERVICE_RESPONSE_NAME = None
     element_container_name = None  # The name of the XML element wrapping the collection of returned items
     extra_element_names = []  # Some services may return multiple item types. List them here.
 
@@ -120,7 +113,7 @@ class EWSService:
             except ExpatError as e:
                 raise SOAPError('SOAP response is not XML: %s' % e) from e
             try:
-                res = self._get_soap_payload(soap_response=soap_response_payload)
+                res = self._get_soap_response(soap_response=soap_response_payload)
             except (ErrorInvalidSchemaVersionForMailboxVersion, ErrorInvalidServerVersion):
                 assert account  # This should never happen for non-account services
                 # The guessed server version is wrong for this account. Try the next version
@@ -134,23 +127,20 @@ class EWSService:
         raise ErrorInvalidSchemaVersionForMailboxVersion('Tried versions %s but all were invalid for account %s' %
                                                          (api_versions, account))
 
-    def _get_soap_payload(self, soap_response):
+    def _get_soap_response(self, soap_response):
         assert isinstance(soap_response, ElementType)
         body = soap_response.find('{%s}Body' % SOAPNS)
         if body is None:
             raise TransportError('No Body element in SOAP response')
 
-        # Check whether has specified service response name, otherwise uses the service name
-        if self.SERVICE_RESPONSE_NAME is not None:
-            response = body.find('{%s}%s' % (MNS, self.SERVICE_RESPONSE_NAME))
-        else:
-            response = body.find('{%s}%sResponse' % (MNS, self.SERVICE_NAME))
+        response = body.find('{%s}%sResponse' % (MNS, self.SERVICE_NAME))
 
         if response is None:
             fault = body.find('{%s}Fault' % SOAPNS)
             if fault is None:
                 raise SOAPError('Unknown SOAP response: %s' % xml_to_str(body))
             self._raise_soap_errors(fault=fault)  # Will throw SOAPError
+
         response_messages = response.find('{%s}ResponseMessages' % MNS)
         if response_messages is None:
             return response.findall('{%s}%sResponse' % (MNS, self.SERVICE_NAME))
